@@ -4,6 +4,7 @@ import multiprocessing as mp
 import warnings
 import numpy as np
 import torch
+import torch.nn.functional as F  # <--- 이 줄을 추가하세요!
 import tqdm
 import mmcv
 
@@ -267,3 +268,51 @@ class MultiSceneNeRF(BaseNeRF):
             log_vars=log_vars, num_samples=num_scenes)
 
         return outputs_dict
+    
+    def eval_and_viz(self, data, decoder, code, density_bitfield, viz_dir=None, cfg=dict()):
+        # 1. 2D 평가는 부모 클래스 기능 활용
+        log_vars, outputs = super().eval_and_viz(data, decoder, code, density_bitfield, viz_dir, cfg)
+
+        # 2. 3D 볼륨 재구성 및 지표 계산
+        if 'gt_volume' in data and data['gt_volume'] is not None:
+            processed_code = decoder.preproc(code)
+            gt_volume = data['gt_volume']
+            D, H, W = gt_volume.shape
+            device = gt_volume.device
+            
+            # CPU 할당 제거 -> 처음부터 GPU(device)에 결과 텐서 할당
+            pred_volume = torch.zeros((D, H, W), device=device)
+            chunk_size = 128 * 128 * 64  # VRAM 여유에 따라 조절
+            
+            # 좌표계 생성 (-1 to 1)
+            z, y, x = [torch.linspace(-1, 1, s, device=device) for s in [D, H, W]]
+            grid_z, grid_y, grid_x = torch.meshgrid(z, y, x, indexing='ij')
+            coords_flat = torch.stack([grid_x, grid_y, grid_z], dim=-1).reshape(-1, 3)
+
+            for i in range(0, coords_flat.shape[0], chunk_size):
+                chunk_pts = coords_flat[i : i + chunk_size].unsqueeze(0) 
+                
+                with torch.no_grad():
+                    sigmas, _, _ = decoder.point_decode(chunk_pts, None, processed_code)
+                    # 계산된 즉시 GPU 텐서에 삽입
+                    pred_volume.view(-1)[i : i + chunk_size] = sigmas.squeeze(-1).squeeze(0)
+            
+            # 정규화 및 PSNR 계산 로직
+            p_min, p_max = pred_volume.min(), pred_volume.max()
+            pred_vol_norm = (pred_volume - p_min) / (p_max - p_min + 1e-8)
+
+            g_min, g_max = gt_volume.min(), gt_volume.max()
+            gt_vol_norm = (gt_volume - g_min) / (g_max - g_min + 1e-8)
+
+            mse_3d = torch.mean((pred_vol_norm - gt_vol_norm) ** 2)
+            log_vars['val_psnr_3d'] = (20.0 * torch.log10(1.0 / torch.sqrt(mse_3d + 1e-10))).item()
+            
+            # 볼륨 데이터 저장 로직 (저장할 때만 CPU로 복사)
+            if viz_dir is not None:
+                save_path = os.path.join(viz_dir, f"volume_pred.pt")
+                torch.save(pred_volume.cpu(), save_path)
+            
+            # 선언된 정확한 변수명으로 메모리 해제
+            del pred_volume, pred_vol_norm, gt_vol_norm 
+
+        return log_vars, outputs

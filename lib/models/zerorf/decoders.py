@@ -64,77 +64,70 @@ def positional_encoding(positions, freqs):
 
 
 class CommonDecoder(nn.Module):
-
-    def __init__(self, point_channels, sh_coef_only=False, dir_pe=False, sdf_mode=False):
+    """
+    X-ray Attenuation 전용 디코더.
+    시점 의존적인 RGB 및 SH 연산을 제거하고, Softplus를 적용하여 
+    의료 영상(CT) 내부의 연속적인 감쇠 계수(Attenuation) 학습에 최적화됨.
+    """
+    def __init__(self, point_channels, sh_coef_only=False, dir_pe=False, sdf_mode=False, xray_mode=True):
         super().__init__()
         
-        self.sh_coef_only = sh_coef_only
-        self.dir_pe = dir_pe
-        
-        self.dir_encoder = SHEncoder(degree=3)
+        # 1. Point Feature Base Network
         self.base_net = nn.Linear(point_channels, 64)
         self.base_activation = nn.SiLU()
-        if sdf_mode:
-            self.variance = nn.Parameter(torch.tensor(0.3))
-            self.variance_act = TruncExp()
-            self.density_net = nn.Linear(64, 1)
-        else:
-            self.density_net = nn.Sequential(
-                nn.Linear(64, 1),
-                TruncExp()
-            )
-        if self.sh_coef_only:
-            self.dir_net = None
-            self.color_net = nn.Linear(64, 27)
-        else:
-            if dir_pe:
-                self.pe = 5
-                self.dir_net = nn.Linear(self.pe * 6, 64)
-            else:
-                self.dir_net = nn.Linear(9, 64)
-            self.color_net = nn.Sequential(
-                nn.Linear(64, 3),
-                nn.Sigmoid()
-            )
-        self.sigmoid_saturation = 0.001
-        self.interp_mode = 'bilinear'
-        self.sdf_mode = sdf_mode
-    
+        
+        # 2. 추가적인 MLP 레이어 정의 (ModuleList 사용)
+        # 64 -> 64 크기의 선형 계층 3개를 생성합니다.
+        self.layer1 = nn.Linear(64, 64)
+        self.layer2 = nn.Linear(64, 64)
+        self.layer3 = nn.Linear(128, 64)
+        self.mlp_activation = nn.ReLU()
+        
+        # 3. Attenuation (Sigma) Network
+        self.density_net = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Softplus(beta=1.0)
+        )
+        
+        # 3. X-ray 태스크에서 불필요한 NVS 관련 분기 완전 제거
+        self.dir_encoder = None
+        self.dir_net = None
+        self.color_net = None
+        
         self.init_weights()
 
     def init_weights(self):
+        """남아있는 선형 계층(Linear)에 대한 가중치 초기화만 수행합니다."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 xavier_init(m, distribution='uniform')
-        if self.dir_net is not None:
-            constant_init(self.dir_net, 0)
 
-    def forward(self, point_code, dirs, out_sdf=False):
+    def forward(self, point_code, dirs=None, out_sdf=False):
+        """
+        Args:
+            point_code: [M, point_channels] 형태의 3D Feature 좌표 값
+            dirs: 파이프라인 호환용 (사용되지 않음)
+            out_sdf: 파이프라인 호환용 (사용되지 않음)
+            
+        Returns:
+            sigmas: [M] 형태의 1채널 X-ray Attenuation 값
+            rgbs: 항상 None을 반환
+        """
+        # Feature 디코딩
         base_x = self.base_net(point_code)
-        base_x_act = self.base_activation(base_x)
-        sigmas = self.density_net(base_x_act).squeeze(-1)
-        if self.sdf_mode:
-            if not out_sdf:
-                s = self.variance_act(10 * self.variance).clamp(1e-6, 1e6)
-                cov = self.variance_act(-s * sigmas).clamp(1e-6, 1e6)
-                sigmas = s * cov / (1 + cov) ** 2
-        if dirs is None:
-            rgbs = None
-        else:
-            dirs = torch.cat(dirs, dim=0) if len(dirs) > 1 else dirs[0]
-            if self.sh_coef_only:
-                sh_enc = self.dir_encoder(dirs).to(base_x.dtype)
-                coefs = self.color_net(base_x_act).reshape(*base_x_act.shape[:-1], 9, 3)
-                rgbs = torch.relu(0.5 + (coefs * sh_enc[..., None]).sum(-2))
-            else:
-                if self.dir_pe:
-                    sh_enc = positional_encoding(dirs, self.pe).to(base_x.dtype)
-                else:
-                    sh_enc = self.dir_encoder(dirs).to(base_x.dtype)
-                color_in = self.base_activation(base_x + self.dir_net(sh_enc))
-                rgbs = self.color_net(color_in)
-                if self.sigmoid_saturation > 0:
-                    rgbs = rgbs * (1 + self.sigmoid_saturation * 2) - self.sigmoid_saturation
+        x = self.base_activation(base_x)
+        
+        # [핵심] for 문을 사용하여 정의된 MLP 레이어들을 순차적으로 통과
+        x = self.mlp_activation(self.layer1(x))
+        x = self.mlp_activation(self.layer2(x))
+        x = self.mlp_activation(self.layer3(torch.cat([x, base_x], dim=-1)))
+
+        # Attenuation(mu) 계산
+        sigmas = self.density_net(x).squeeze(-1)
+        
+        # X-ray 렌더링 방식에 맞게 RGB 채널은 None 처리
+        rgbs = None
+        
         return sigmas, rgbs
 
 
@@ -142,8 +135,8 @@ class CommonDecoder(nn.Module):
 class TensorialDecoder(PointBasedVolumeRenderer):
     preprocessor: TensorialGenerator
 
-    def __init__(self, *args, preprocessor: dict, separate_density_and_color: bool, subreduce, reduce, n_images, image_h, image_w, sh_coef_only=False, sdf_mode=False, visualize_mesh=False, **kwargs):
-        super().__init__(*args, preprocessor=preprocessor, **kwargs)
+    def __init__(self, *args, preprocessor: dict, separate_density_and_color: bool, subreduce, reduce, n_images, image_h, image_w, sh_coef_only=False, sdf_mode=False, xray_mode=False, visualize_mesh=False, **kwargs):
+        super().__init__(*args, preprocessor=preprocessor, xray_mode=xray_mode, **kwargs)
         assert isinstance(self.preprocessor, TensorialGenerator)
         if reduce == 'cat':
             in_chs = self.preprocessor.out_ch * len(self.preprocessor.tensor_config) // subreduce
@@ -153,13 +146,13 @@ class TensorialDecoder(PointBasedVolumeRenderer):
         self.separate_density_and_color = separate_density_and_color
         self.pe = 5
         if separate_density_and_color:
-            self.density_decoder = CommonDecoder(in_chs // 2, sh_coef_only, sdf_mode=sdf_mode)
-            self.color_decoder = CommonDecoder(in_chs // 2, sh_coef_only, sdf_mode=sdf_mode)
+            self.density_decoder = CommonDecoder(in_chs // 2, sh_coef_only, sdf_mode=sdf_mode, xray_mode=xray_mode)
+            self.color_decoder = CommonDecoder(in_chs // 2, sh_coef_only, sdf_mode=sdf_mode, xray_mode=xray_mode)
         else:
             if reduce == 'cat':
-                self.common_decoder = CommonDecoder(in_chs, sh_coef_only, sdf_mode=sdf_mode)
+                self.common_decoder = CommonDecoder(in_chs, sh_coef_only, sdf_mode=sdf_mode, xray_mode=xray_mode)
             else:
-                self.common_decoder = CommonDecoder(in_chs, sh_coef_only, sdf_mode=sdf_mode)
+                self.common_decoder = CommonDecoder(in_chs, sh_coef_only, sdf_mode=sdf_mode, xray_mode=xray_mode)
         self.subreduce = subreduce
         self.reduce = reduce
         self.sdf_mode = sdf_mode
@@ -204,7 +197,7 @@ class TensorialDecoder(PointBasedVolumeRenderer):
             coords = xyzs[..., ['xyzt'.index(axis) for axis in cfg]]
             coords = coords.reshape(code.shape[0], 1, xyzs.shape[-2], 2)
             codes.append(
-                F.grid_sample(got, coords, mode='bilinear', padding_mode='border', align_corners=False)
+                F.grid_sample(got, coords, mode='bilinear', padding_mode='zeros', align_corners=False)
                 .reshape(code.shape[0], got.shape[1], xyzs.shape[-2]).transpose(1, 2)
             )
         codes_subred = []

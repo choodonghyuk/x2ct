@@ -1,14 +1,12 @@
 import sys
 import shutil
-
-sys.path.append('.')
-
 import os
 import cv2
 import tqdm
 import json
 import numpy
 import wandb
+import numpy as np
 import torch
 import torch_redstone as rst
 from sklearn.cluster import KMeans
@@ -18,12 +16,16 @@ from lib.core.optimizer import build_optimizers
 from lib.core.ssdnerf_gui import OrbitCamera
 from lib.datasets.nerf_synthetic import NerfSynthetic
 from lib.datasets.oppo import OppoDataset
+from lib.datasets.xray_dataset import XrayDataset
 from PIL import Image
 import einops
 from opt import config_parser
 from pprint import pprint
+import warnings
+warnings.filterwarnings("ignore")  # 모든 경고 메시지 무시
 
 torch.backends.cuda.matmul.allow_tf32 = True
+os.environ["WANDB_MODE"] = "disabled"
 
 def kmeans_downsample(points, n_points_to_sample):
     kmeans = KMeans(n_points_to_sample).fit(points)
@@ -62,73 +64,74 @@ if args.load_image:
     focal_length = y / numpy.tan(meta['fovy'] / 2)
     intrinsics = numpy.array([[focal_length, focal_length, x, y]] * args.n_views)
 
-work_dir = "results/%s" % args.proj_name
+# Resolve data paths to absolute before changing cwd
+if args.data_path:
+    args.data_path = os.path.abspath(args.data_path)
+if args.data_dir:
+    args.data_dir = os.path.abspath(args.data_dir)
+
+if args.data_path:
+    data_name = os.path.splitext(os.path.basename(args.data_path))[0]
+else:
+    data_name = args.obj
+
+# 2. 폴더명 조합: {프로젝트명}_{데이터명}_res{해상도}_ch{채널}
+# 예: results/test_chest_res20_ch8
+folder_name = f"{args.proj_name}_{data_name}_{args.rep}_res{args.model_res}_ch{args.model_ch}"
+work_dir = os.path.join("results", folder_name)
+
+# 3. 폴더 생성 및 이동
+print(f">> Working Directory: {work_dir}")
 os.makedirs(work_dir, exist_ok=True)
 os.chdir(work_dir)
 
-if not args.load_image:
-    if args.dataset == "nerf_syn":
-        model_scale = dict(chair=2.1, drums=2.3, ficus=2.3, hotdog=3.0, lego=2.4, materials=2.4, mic=2.5, ship=2.75)
-        world_scale = 2 / model_scale[args.obj]
-        dataset = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_train.json"], rgba=True, world_scale=world_scale)
-        val = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_val.json"], world_scale=world_scale)
-        test = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_test.json"], world_scale=world_scale)
-        
-        entry = dataset[0]
-        selected_idxs = kmeans_downsample(entry['cond_poses'][..., :3, 3], args.n_views)
-    elif args.dataset == "oi":
-        world_scale = 5.0
-        dataset = OppoDataset(f"{args.data_dir}/{args.obj}/output", split='train', world_scale=world_scale, rgba=True)
-        val = OppoDataset(f"{args.data_dir}/{args.obj}/output", split='test', world_scale=world_scale)
-        test = OppoDataset(f"{args.data_dir}/{args.obj}/output", split='test', world_scale=world_scale) 
+print(f">> Loading X-ray dataset: {args.obj} ...")
+data_path = args.data_path or os.path.join(args.data_dir, args.obj + '.pickle')
 
-        entry = dataset[0]
-        if args.n_views == 6:
-            selected_idxs = [10, 3, 19, 22, 17, 35]
-        elif args.n_views == 4:
-            selected_idxs = [10, 33, 35, 6]
-        else:
-            selected_idxs = kmeans_downsample(entry['cond_poses'][..., :3, 3], args.n_views)
-    
-    data_entry = dict(
-        cond_imgs=torch.tensor(entry['cond_imgs'][selected_idxs][None]).float().to(device),
-        cond_poses=torch.tensor(entry['cond_poses'])[selected_idxs][None].float().to(device),
-        cond_intrinsics=torch.tensor(entry['cond_intrinsics'])[selected_idxs][None].float().to(device),
-        scene_id=[0],
-        scene_name=[args.proj_name]
+# Train / Val 데이터셋
+dataset = XrayDataset(data_path, split='train')
+val = XrayDataset(data_path, split='val')
+
+# GT Volume 로드 (3D PSNR 계산용)
+gt_volume = None
+if hasattr(dataset, 'gt_volume'):
+    gt_volume = dataset.gt_volume
+    if isinstance(gt_volume, np.ndarray):
+        gt_volume = torch.from_numpy(gt_volume).to(device)
+    else:
+        gt_volume = gt_volume.to(device)
+    print(f">> GT Volume loaded. Shape: {gt_volume.shape}")
+
+entry = dataset[0]
+args.n_views = dataset.n_views  # auto-detect view count
+selected_idxs = list(range(args.n_views))  # use all views
+
+# 학습용 데이터 엔트리
+data_entry = dict(
+    cond_imgs=torch.tensor(entry['cond_imgs'][None]).float().to(device),
+    cond_poses=torch.tensor(entry['cond_poses'])[None].float().to(device),
+    cond_intrinsics=torch.tensor(entry['cond_intrinsics'])[None].float().to(device),
+    scene_id=[0],
+    scene_name=[args.proj_name]
+)
+val_entry_data = val[0]
+# 검증용 데이터 엔트리 (gt_volume 포함)
+val_entry = dict(
+    test_imgs=torch.tensor(val_entry_data['cond_imgs'][None]).float().to(device),
+    test_poses=torch.tensor(val_entry_data['cond_poses'])[None].float().to(device),
+    test_intrinsics=torch.tensor(val_entry_data['cond_intrinsics'])[None].float().to(device),
+    scene_id=[0],
+    scene_name=[args.proj_name],
+    gt_volume=gt_volume  # [중요] 모델 내부 eval_and_viz로 전달됨
     )
-    entry = val[0]
-    val_entry = dict(
-        test_imgs=torch.tensor(entry['cond_imgs'][:args.n_val][None]).float().to(device),
-        test_poses=torch.tensor(entry['cond_poses'][:args.n_val])[None].float().to(device),
-        test_intrinsics=torch.tensor(entry['cond_intrinsics'][:args.n_val])[None].float().to(device),
-        scene_id=[0],
-        scene_name=[args.proj_name]
-    )
-    entry = test[0]
-    test_entry = dict(
-        test_imgs=torch.tensor(entry['cond_imgs'][:][None]).float().to(device),
-        test_poses=torch.tensor(entry['cond_poses'][:])[None].float().to(device),
-        test_intrinsics=torch.tensor(entry['cond_intrinsics'][:])[None].float().to(device),
-        scene_id=[0],
-        scene_name=[args.proj_name]
-    )
-else:
-    data_entry = dict(
-        cond_imgs=images,
-        cond_poses=torch.tensor(poses)[None].float().to(device) * 0.9,
-        cond_intrinsics=torch.tensor(intrinsics)[None].float().to(device),
-        scene_id=[0],
-        scene_name=[args.proj_name]
-    )
-    selected_idxs = list(range(args.n_views))
+test_entry = val_entry 
+
+selected_idxs = list(range(args.n_views))
 
 pic_h = data_entry['cond_imgs'].shape[-3]
 pic_w = data_entry['cond_imgs'].shape[-2]
-if args.load_image:
-    args.model_res = 4
-    pic_h = pic_w = 320
-cam = OrbitCamera('render', pic_w, pic_h, 3.2, 48)
+
+xray_mode = args.dataset == "xray"
 
 decoder_1 = dict(
     type='TensorialDecoder',
@@ -139,17 +142,19 @@ decoder_1 = dict(
             ['xy', 'z', 'yz', 'x', 'zx', 'y']
         )
     ),
-    subreduce=1 if args.load_image else 2,
+    subreduce=2,
     reduce='cat',
     separate_density_and_color=False,
     sh_coef_only=False,
     sdf_mode=False,
+    xray_mode=xray_mode,
     max_steps=1024 if not args.load_image else 320,
     n_images=args.n_views,
     image_h=pic_h,
     image_w=pic_w,
     has_time_dynamics=False,
-    visualize_mesh=False
+    visualize_mesh=False,
+    occlusion_culling_th=0.0 if xray_mode else 0.0001,
 )
 decoder_2 = dict(
     type='FreqFactorizedDecoder',
@@ -163,13 +168,15 @@ decoder_2 = dict(
     separate_density_and_color=False,
     sh_coef_only=False,
     sdf_mode=False,
+    xray_mode=xray_mode,
     max_steps=1024 if not args.load_image else 640,
     n_images=args.n_views,
     image_h=pic_h,
     image_w=pic_w,
     has_time_dynamics=False,
     freq_bands=[None, 0.4],
-    visualize_mesh=False
+    visualize_mesh=False,
+    occlusion_culling_th=0.0 if xray_mode else 0.0001,
 )
 
 patch_reg_loss = build_module(dict(
@@ -185,18 +192,18 @@ nerf: MultiSceneNeRF = build_model(dict(
     patch_size=32,
     decoder=decoder_2 if args.rep == 'dif' else decoder_1,
     decoder_use_ema=False,
-    bg_color=1.0,
+    bg_color=0.0 if xray_mode else 1.0,
     pixel_loss=dict(
         type='MSELoss',
         loss_weight=3.2
     ),
-    use_lpips_metric=torch.cuda.mem_get_info()[1] // 1000 ** 3 >= 32,
+    use_lpips_metric=False if xray_mode else (torch.cuda.mem_get_info()[1] // 1000 ** 3 >= 32),
     cache_size=1,
     cache_16bit=False,
-    init_from_mean=True
+    init_from_mean=False
 ), train_cfg = dict(
-    dt_gamma_scale=0.5,
-    density_thresh=0.05,
+    dt_gamma_scale=0,
+    density_thresh=-1.0,
     extra_scene_step=0,
     n_inverse_rays=args.n_rays_init,
     n_decoder_rays=args.n_rays_init,
@@ -210,9 +217,9 @@ nerf: MultiSceneNeRF = build_model(dict(
 ),
 test_cfg = dict(
     img_size=(pic_h, pic_w),
-    density_thresh=0.01,
-    max_render_rays=pic_h * pic_w,
-    dt_gamma_scale=0.5,
+    density_thresh=0,
+    max_render_rays=1024, # [메모리 보호] 검증 시 Chunking
+    dt_gamma_scale=0.0,
     n_inverse_rays=args.n_rays_init,
     loss_coef=0.1 / (pic_h * pic_w),
     n_inverse_steps=400,
@@ -221,111 +228,98 @@ test_cfg = dict(
     return_depth=False
 ))
 
-nerf.bg_color = nerf.decoder.bg_color = torch.nn.Parameter(torch.ones(3) * args.bg_color, requires_grad=args.learn_bg)
+nerf.bg_color = nerf.decoder.bg_color = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
 nerf.to(device)
 nerf.train()
+
 optim = build_optimizers(nerf, dict(decoder=dict(type='AdamW', lr=args.net_lr, foreach=True, weight_decay=0.2, betas=(0.9, 0.98))))
 lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim['decoder'], args.n_iters, eta_min=args.net_lr_decay_to)
 
-wandb.init(
-    project=args.wandb_project,
-    name=args.proj_name,
-    save_code=True,
-    config=dict(selected_idxs=selected_idxs)
-)
 prog = tqdm.trange(args.n_iters)
 best_psnr = 0.0
+best_psnr_3d = 0.0
+
+# [추가] 로그 파일 생성 및 헤더 작성
+log_txt_path = "val_log.txt"
+with open(log_txt_path, "w") as f:
+    f.write("Step\tVal_PSNR\t3D_PSNR\n")  # 헤더
 
 for j in prog:
-    lv = nerf.train_step(data_entry, optim)['log_vars']
+    # -------------------------------------------------------------------------
+    # 1. 학습 스텝 (Training Step)
+    # -------------------------------------------------------------------------
+    outputs = nerf.train_step(data_entry, optim)
+    lv = outputs['log_vars']
     lr_sched.step()
-    lv.pop('code_rms')
-    lv.pop('loss')
-    prog.set_postfix(**lv)
-    wandb.log(dict(train=lv))
+
+    # 불필요한 로그 키 제거
+    if 'code_rms' in lv: lv.pop('code_rms')
+    if 'loss' in lv: lv.pop('loss')
+    
     if j == 50:
         nerf.train_cfg['n_inverse_rays'] = round((args.n_rays_init * args.n_rays_up) ** 0.5)
         nerf.train_cfg['n_decoder_rays'] = round((args.n_rays_init * args.n_rays_up) ** 0.5)
     if j == 100:
         nerf.train_cfg['n_inverse_rays'] = args.n_rays_up
         nerf.train_cfg['n_decoder_rays'] = args.n_rays_up
+
+    # -------------------------------------------------------------------------
+    # 2. 검증 (Validation) - 1000번마다 실행
+    # -------------------------------------------------------------------------
     if j % args.val_iter == args.val_iter - 1:
-        cam = OrbitCamera('final', pic_w, pic_h, 3.2, 48)
         cache = nerf.cache[0]
         nerf.eval()
-        if not args.load_image:
-            with torch.no_grad():
-                if os.path.exists("viz"):
-                    shutil.rmtree("viz")
-                log_vars, _ = nerf.eval_and_viz(
-                    val_entry, nerf.decoder,
-                    cache['param']['code_'][None].to(device),
-                    cache['param']['density_bitfield'][None].to(device),
-                    "viz",
-                    cfg=nerf.test_cfg
-                )
-            print()
-            print(log_vars)
-            wandb.log(dict(val=log_vars))
-            this_psnr = log_vars['test_psnr']
-        if args.load_image or this_psnr >= best_psnr or j == len(prog) - 1:
-            torch.save(nerf.state_dict(), open("nerf-zerorf.pt", "wb"))
-            best_psnr = this_psnr if not args.load_image else 0
-            out = cv2.VideoWriter('dec_%d.avi' % j, cv2.VideoWriter_fourcc(*'MJPG'), 24.0, (pic_w, pic_h))
-            with torch.no_grad():
-                for i in tqdm.trange(60, desc='%.2f' % best_psnr):
-                    test_pose = cam.pose
-                    test_intrinsic = cam.intrinsics
-                    if args.dataset == "oi":
-                        revert_y = numpy.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-                        test_pose = test_pose @ revert_y
-                    test_time = i / 60 * 2 - 1
-                    render_result = nerf.render(
-                        nerf.decoder,
-                        cache['param']['code_'][None].to(device),
-                        cache['param']['density_bitfield'][None].to(device),
-                        pic_h, pic_w,
-                        torch.tensor(test_intrinsic[None, None]).float().to(device),
-                        torch.tensor(test_pose[None, None]).float().to(device),
-                        None,
-                        nerf.test_cfg
-                    )
-                    if args.dataset == "oi":
-                        cam.orbit(60, -numpy.sin(i / 60 * numpy.pi * 2) * 24)
-                    else:
-                        cam.orbit(60, numpy.sin(i / 60 * numpy.pi * 2) * 24)
-                    frame = render_result[0].squeeze().float().cpu()
-                    if not numpy.isfinite(frame).all():
-                        print("Non-finite value!")
-                    out.write(cv2.cvtColor(
-                        (torch.clamp(frame, 0, 1).numpy() * 255).astype(numpy.uint8),
-                        cv2.COLOR_RGB2BGR
-                    ))
-                if j == len(prog) - 1:
-                    log_vars, _ = nerf.eval_and_viz(
-                        dict(
-                            test_poses=data_entry['cond_poses'],
-                            test_intrinsics=data_entry['cond_intrinsics'],
-                            test_times=data_entry.get('cond_times'),
-                            scene_id=[0],
-                            scene_name=["0"]
-                        ), nerf.decoder,
-                        cache['param']['code_'][None].to(device),
-                        cache['param']['density_bitfield'][None].to(device),
-                        "viz/train_viz",
-                        cfg=nerf.test_cfg
-                    )
-                    wandb.log(dict(train_final=log_vars))
-                    if not args.load_image:
-                        log_vars, _ = nerf.eval_and_viz(
-                            test_entry, nerf.decoder,
-                            cache['param']['code_'][None].to(device),
-                            cache['param']['density_bitfield'][None].to(device),
-                            "viz/test_viz",
-                            cfg=nerf.test_cfg
-                        )
-                        print()
-                        print('Final test:')
-                        print(log_vars)
-                        wandb.log(dict(test=log_vars))
-            out.release()
+        
+        with torch.no_grad():
+            # 스텝별 폴더 생성
+            current_viz_dir = os.path.join("viz", f"step{j+1:06d}")
+            os.makedirs(current_viz_dir, exist_ok=True)
+            
+            # Validation 수행
+            log_vars, _ = nerf.eval_and_viz(
+                val_entry, nerf.decoder,
+                cache['param']['code_'][None].to(device),
+                cache['param']['density_bitfield'][None].to(device),
+                current_viz_dir,
+                cfg=nerf.test_cfg
+            )
+        
+        # 점수 가져오기
+        this_psnr = log_vars.get('test_psnr', 0.0)
+        this_psnr_3d = log_vars.get('val_psnr_3d', 0.0)
+        
+        # [핵심 1] 터미널에 별도 로그 출력 (Progress Bar와 섞이지 않게)
+        # 예: [Val] Step 1000 | 2D PSNR: 30.1234 | 3D PSNR: 32.5678
+        log_message = f"[Val] Step {j+1:05d} | 2D PSNR: {this_psnr:.4f} | 3D PSNR: {this_psnr_3d:.4f}"
+        tqdm.tqdm.write(log_message)
+
+        # [핵심 2] TXT 파일에 저장
+        with open(log_txt_path, "a") as f:
+            f.write(f"{j+1}\t{this_psnr:.4f}\t{this_psnr_3d:.4f}\n")
+
+        # Best Model 저장
+        lv.update(log_vars)
+        if this_psnr > best_psnr:
+            best_psnr = this_psnr
+            torch.save(nerf.state_dict(), open("nerf-zerorf-best.pt", "wb"))
+        if this_psnr_3d > best_psnr_3d:
+            best_psnr_3d = this_psnr_3d
+
+        torch.cuda.empty_cache()
+
+    # -------------------------------------------------------------------------
+    # 3. 로그 업데이트 (Progress Bar)
+    # -------------------------------------------------------------------------
+    # 여기서는 3D PSNR을 굳이 표시하지 않고, 기본적인 학습 정보만 표시 (깔끔하게)
+    # 검증 때 얻은 log_vars가 lv에 업데이트되어 있긴 하지만, 다음 step에서 자연스럽게 사라지거나 유지됨
+    # 사용자 요청대로 '평소엔 깔끔하게, 검증 때만 확인' 의도에 맞춤
+    log_msg = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in lv.items() 
+        if k not in ['test_psnr', 'val_psnr_3d', 'test_ssim', 'test_lpips']} # 진행바에서는 제외
+    prog.set_postfix(**log_msg)
+
+# -------------------------------------------------------------------------
+# 4. 학습 종료 (Final)
+# -------------------------------------------------------------------------
+print(f"\n>> Training Complete. Saving final model...")
+torch.save(nerf.state_dict(), open("nerf-zerorf-final.pt", "wb"))

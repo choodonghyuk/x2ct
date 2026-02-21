@@ -329,17 +329,24 @@ class BaseNeRF(nn.Module):
         outputs = decoder(
             rays_o, rays_d, code, density_bitfield, self.grid_size, sample_inds=sample_inds, rays_time=rays_time,
             dt_gamma=dt_gamma, perturb=True, return_loss=return_decoder_loss, **kwargs)
-        out_weights = outputs['weights_sum']
-        out_rgbs = outputs['image'] + outputs.get('bg', self.bg_color) * (1 - out_weights.unsqueeze(-1))
+        xray_mode = getattr(decoder, 'xray_mode', False)
+        if xray_mode:
+            # X-ray: projection output directly (no background compositing)
+            out_rgbs = outputs['image']  # (num_scenes, num_rays, 1)
+        else:
+            out_weights = outputs['weights_sum']
+            out_rgbs = outputs['image'] + outputs.get('bg', self.bg_color) * (1 - out_weights.unsqueeze(-1))
         scale = 1 - math.exp(-cfg['loss_coef'] * scale_num_ray) if 'loss_coef' in cfg else 1
-        if target_rgbs.shape[-1] == 4:
+        if not xray_mode and target_rgbs.shape[-1] == 4:
             target_rgbs[..., :3] = target_rgbs[..., :3] * target_rgbs[..., 3:] + (1 - target_rgbs[..., 3:])
             out_rgbs = torch.cat([out_rgbs, out_weights.unsqueeze(-1)], dim=-1)
+        # For X-ray: scale * 1 channel; for RGB: scale * 3 channels
+        n_channels = 1 if xray_mode else 3
         pixel_loss = self.pixel_loss(
-            out_rgbs, target_rgbs.reshape(out_rgbs.size())) * (scale * 3)
+            out_rgbs, target_rgbs.reshape(out_rgbs.size())) * (scale * n_channels)
         loss = pixel_loss
         loss_dict = dict(pixel_loss=pixel_loss)
-        if self.patch_loss is not None:
+        if not xray_mode and self.patch_loss is not None:
             assert target_rgbs.dim() == 4  # (num_patches, h, w, 3)
             patch_loss = self.patch_loss(
                 out_rgbs.reshape(target_rgbs.size()).permute(0, 3, 1, 2),  # (num_patches, 3, h, w)
@@ -347,7 +354,7 @@ class BaseNeRF(nn.Module):
             ) * scale
             loss = loss + patch_loss
             loss_dict.update(patch_loss=patch_loss)
-        if self.patch_reg_loss is not None:
+        if not xray_mode and self.patch_reg_loss is not None:
             assert target_rgbs.dim() == 4  # (num_patches, h, w, 3)
             patch_reg_loss = self.patch_reg_loss(
                 outputs['weights_sum'].reshape(*target_rgbs.shape[:-1], 1).permute(0, 3, 1, 2),  # (num_patches, 1, h, w)
@@ -533,6 +540,7 @@ class BaseNeRF(nn.Module):
 
         out_image = []
         out_depth = []
+        xray_mode = getattr(decoder, 'xray_mode', False)
         if rays_time is None:
             rays_time = len(rays_o) * [None]
         for rays_o_single, rays_d_single, rays_time_single in zip(rays_o, rays_d, rays_time):
@@ -541,20 +549,29 @@ class BaseNeRF(nn.Module):
                 code, density_bitfield, self.grid_size,
                 rays_time=rays_time_single,
                 dt_gamma=dt_gamma, perturb=False)
-            weights_sum = torch.stack(outputs['weights_sum'], dim=0) if num_scenes > 1 else outputs['weights_sum'][0]
-            return_rgba = cfg.get('return_rgba', False)
-            if not return_rgba:
-                rgbs = (torch.stack(outputs['image'], dim=0) if num_scenes > 1 else outputs['image'][0]) \
-                    + outputs.get('bg', self.bg_color) * (1 - weights_sum.unsqueeze(-1))
-                out_image.append(rgbs)
+            if xray_mode:
+                # X-ray: projection output directly (1 channel, no background)
+                projection = torch.stack(outputs['image'], dim=0) if num_scenes > 1 else outputs['image'][0]
+                out_image.append(projection)
             else:
-                rgbs = (torch.stack(outputs['image'], dim=0) if num_scenes > 1 else outputs['image'][0])
-                rgbas = torch.cat([rgbs, weights_sum.unsqueeze(-1)], dim=-1)
-                out_image.append(rgbas)
+                weights_sum = torch.stack(outputs['weights_sum'], dim=0) if num_scenes > 1 else outputs['weights_sum'][0]
+                return_rgba = cfg.get('return_rgba', False)
+                if not return_rgba:
+                    rgbs = (torch.stack(outputs['image'], dim=0) if num_scenes > 1 else outputs['image'][0]) \
+                        + outputs.get('bg', self.bg_color) * (1 - weights_sum.unsqueeze(-1))
+                    out_image.append(rgbs)
+                else:
+                    rgbs = (torch.stack(outputs['image'], dim=0) if num_scenes > 1 else outputs['image'][0])
+                    rgbas = torch.cat([rgbs, weights_sum.unsqueeze(-1)], dim=-1)
+                    out_image.append(rgbas)
             depth = torch.stack(outputs['depth'], dim=0) if num_scenes > 1 else outputs['depth'][0]
             out_depth.append(depth)
         out_image = torch.cat(out_image, dim=-2) if len(out_image) > 1 else out_image[0]
-        out_image = out_image.reshape(num_scenes, num_imgs, h, w, 4 if return_rgba else 3)
+        if xray_mode:
+            out_channels = 1
+        else:
+            out_channels = 4 if cfg.get('return_rgba', False) else 3
+        out_image = out_image.reshape(num_scenes, num_imgs, h, w, out_channels)
         out_depth = torch.cat(out_depth, dim=-1) if len(out_depth) > 1 else out_depth[0]
         out_depth = out_depth.reshape(num_scenes, num_imgs, h, w)
 
@@ -570,27 +587,33 @@ class BaseNeRF(nn.Module):
         test_poses = data['test_poses']
         test_times = data.get('test_times', None)
         num_scenes, num_imgs, _, _ = test_poses.size()
+        xray_mode = getattr(decoder, 'xray_mode', False)
+        n_channels = 1 if xray_mode else 3
 
         if 'test_imgs' in data and not cfg.get('skip_eval', False):
-            test_imgs = data['test_imgs']  # (num_scenes, num_imgs, h, w, 3)
+            test_imgs = data['test_imgs']  # (num_scenes, num_imgs, h, w, C)
             _, _, h, w, _ = test_imgs.size()
             test_img_paths = data.get('test_img_paths', None)  # (num_scenes, (num_imgs,))
-            target_imgs = test_imgs.permute(0, 1, 4, 2, 3).reshape(num_scenes * num_imgs, 3, h, w)
+            target_imgs = test_imgs.permute(0, 1, 4, 2, 3).reshape(num_scenes * num_imgs, n_channels, h, w)
         else:
             test_imgs = test_img_paths = target_imgs = None
             h, w = cfg['img_size']
         image, depth = self.render(
             decoder, code, density_bitfield, h, w, test_intrinsics, test_poses, times=test_times, cfg=cfg)
-        pred_imgs = image.permute(0, 1, 4, 2, 3).reshape(
-            num_scenes * num_imgs, 3, h, w).clamp(min=0, max=1)
-        pred_imgs = torch.round(pred_imgs * 255) / 255
+        if xray_mode:
+            pred_imgs = image.permute(0, 1, 4, 2, 3).reshape(
+                num_scenes * num_imgs, 1, h, w)
+        else:
+            pred_imgs = image.permute(0, 1, 4, 2, 3).reshape(
+                num_scenes * num_imgs, 3, h, w).clamp(min=0, max=1)
+            pred_imgs = torch.round(pred_imgs * 255) / 255
 
         if test_imgs is not None:
             test_psnr = eval_psnr(pred_imgs, target_imgs)
             test_ssim = eval_ssim_skimage(pred_imgs, target_imgs, data_range=1)
             log_vars = dict(test_psnr=float(test_psnr.mean()),
                             test_ssim=float(test_ssim.mean()))
-            if self.lpips is not None:
+            if not xray_mode and self.lpips is not None:
                 if len(self.lpips) == 0:
                     lpips_eval = lpips.LPIPS(
                         net='vgg', eval_mode=True, pnet_tune=False).to(
@@ -613,37 +636,55 @@ class BaseNeRF(nn.Module):
             viz_dir = cfg.get('viz_dir', None)
         if viz_dir is not None:
             os.makedirs(viz_dir, exist_ok=True)
-            output_viz = torch.round(pred_imgs.permute(0, 2, 3, 1) * 255).to(
-                torch.uint8).cpu().numpy().reshape(num_scenes, num_imgs, h, w, 3)
-            if test_imgs is not None:
-                real_imgs_viz = (target_imgs.permute(0, 2, 3, 1) * 255).to(
-                    torch.uint8).cpu().numpy().reshape(num_scenes, num_imgs, h, w, 3)
-                output_viz = np.concatenate([real_imgs_viz, output_viz], axis=-2)
-            for scene_id, scene_name_single in enumerate(scene_name):
-                for img_id in range(num_imgs):
-                    if test_img_paths is not None:
-                        base_name = 'scene_' + scene_name_single + '_' + os.path.splitext(
-                            os.path.basename(test_img_paths[scene_id][img_id]))[0]
-                        name = base_name + '_psnr{:02.1f}_ssim{:.2f}_lpips{:.3f}.png'.format(
-                            test_psnr[scene_id * num_imgs + img_id],
-                            test_ssim[scene_id * num_imgs + img_id],
-                            test_lpips[scene_id * num_imgs + img_id])
-                        existing_files = glob(os.path.join(viz_dir, base_name + '*.png'))
-                        for file in existing_files:
-                            os.remove(file)
-                    else:
-                        name = 'scene_' + scene_name_single + '_{:03d}.png'.format(img_id)
+            if xray_mode:
+                # X-ray: grayscale visualization
+                proj_np = pred_imgs.squeeze(1).cpu().numpy().reshape(num_scenes, num_imgs, h, w)
+                for scene_id, scene_name_single in enumerate(scene_name):
+                    for img_id in range(num_imgs):
+                        name = 'scene_' + scene_name_single + '_{:03d}'.format(img_id)
                         if test_imgs is not None:
-                            name = name + '_psnr{:02.1f}_ssim{:.2f}_lpips{:.3f}.png'.format(
+                            name += '_psnr{:02.1f}_ssim{:.2f}.png'.format(
+                                test_psnr[scene_id * num_imgs + img_id],
+                                test_ssim[scene_id * num_imgs + img_id])
+                        else:
+                            name += '.png'
+                        proj_img = proj_np[scene_id][img_id]
+                        plt.imsave(os.path.join(viz_dir, name), proj_img, cmap='gray')
+                        if test_imgs is not None:
+                            gt_img = target_imgs[scene_id * num_imgs + img_id, 0].cpu().numpy()
+                            plt.imsave(os.path.join(viz_dir, 'gt_' + name), gt_img, cmap='gray')
+            else:
+                output_viz = torch.round(pred_imgs.permute(0, 2, 3, 1) * 255).to(
+                    torch.uint8).cpu().numpy().reshape(num_scenes, num_imgs, h, w, 3)
+                if test_imgs is not None:
+                    real_imgs_viz = (target_imgs.permute(0, 2, 3, 1) * 255).to(
+                        torch.uint8).cpu().numpy().reshape(num_scenes, num_imgs, h, w, 3)
+                    output_viz = np.concatenate([real_imgs_viz, output_viz], axis=-2)
+                for scene_id, scene_name_single in enumerate(scene_name):
+                    for img_id in range(num_imgs):
+                        if test_img_paths is not None:
+                            base_name = 'scene_' + scene_name_single + '_' + os.path.splitext(
+                                os.path.basename(test_img_paths[scene_id][img_id]))[0]
+                            name = base_name + '_psnr{:02.1f}_ssim{:.2f}_lpips{:.3f}.png'.format(
                                 test_psnr[scene_id * num_imgs + img_id],
                                 test_ssim[scene_id * num_imgs + img_id],
                                 test_lpips[scene_id * num_imgs + img_id])
-                    plt.imsave(
-                        os.path.join(viz_dir, name),
-                        output_viz[scene_id][img_id])
-                    plt.imsave(
-                        os.path.join(viz_dir, "depth_" + name),
-                        depth[scene_id][img_id].cpu().numpy())
+                            existing_files = glob(os.path.join(viz_dir, base_name + '*.png'))
+                            for file in existing_files:
+                                os.remove(file)
+                        else:
+                            name = 'scene_' + scene_name_single + '_{:03d}.png'.format(img_id)
+                            if test_imgs is not None:
+                                name = name + '_psnr{:02.1f}_ssim{:.2f}_lpips{:.3f}.png'.format(
+                                    test_psnr[scene_id * num_imgs + img_id],
+                                    test_ssim[scene_id * num_imgs + img_id],
+                                    test_lpips[scene_id * num_imgs + img_id])
+                        plt.imsave(
+                            os.path.join(viz_dir, name),
+                            output_viz[scene_id][img_id])
+                        plt.imsave(
+                            os.path.join(viz_dir, "depth_" + name),
+                            depth[scene_id][img_id].cpu().numpy())
             if isinstance(decoder, DistributedDataParallel):
                 decoder = decoder.module
             code_range = cfg.get('clip_range', [-1, 1])
@@ -651,7 +692,7 @@ class BaseNeRF(nn.Module):
             if self.init_code is not None:
                 decoder.visualize(self.init_code[None], ['000_mean'], viz_dir, code_range=code_range)
 
-        return log_vars, pred_imgs.reshape(num_scenes, num_imgs, 3, h, w)
+        return log_vars, pred_imgs.reshape(num_scenes, num_imgs, n_channels, h, w)
 
     def mean_ema_update(self, code):
         if self.init_code is None:

@@ -7,31 +7,31 @@ def config_parser(cmd=None):
                         help='zero123pp image path')
     parser.add_argument("--proj-name", type=str, default="test",
                         help='experiment name')
-    parser.add_argument("--wandb-project", type=str, 
-                        default="zerorf", help='wandb project name')
     
     # data
     parser.add_argument("--dataset", type=str, 
-                        default="nerf_syn", help='type of dataset')
+                        default="nerf_syn", help='type of dataset (nerf_syn, oi, xray)')
     parser.add_argument("--data-dir", type=str, 
                         default="/root/nerf_synthetic", help='directory of the dataset')
+    parser.add_argument("--data-path", type=str, 
+                        default=None, help='path to pickle file (for xray dataset)')
     parser.add_argument("--obj", type=str, 
-                        default="chair", help='object name')
+                        default="chest", help='object name')
     parser.add_argument("--n-views", type=int, 
-                        default=6, help='number of input views')
+                        default=30, help='number of input views')
     
     # model
     parser.add_argument("--model-res", type=int, 
-                        default=20, help='noise resolution (should be about 1/40 the provided image resolution), ignored when load-image is set')
+                        default=8, help='noise resolution (should be about 1/40 the provided image resolution), ignored when load-image is set')
     parser.add_argument("--model-ch", type=int, 
-                        default=8, help='noise channel')
+                        default=16, help='noise channel')
     parser.add_argument("--n-rays-init", type=int, 
-                        default=2**12, help='number of rays per batch initially')
+                        default=2**10, help='number of rays per batch initially')
     parser.add_argument("--n-rays-up", type=int, 
-                        default=2**16, help='number of rays per batch after 100 iterations')
+                        default=2**12, help='number of rays per batch after 100 iterations')
     parser.add_argument("--learn-bg", action='store_true', help='if learn background')
     parser.add_argument("--bg-color", type=float, 
-                        default=1.0, help='background color')
+                        default=0.0, help='background color')
     parser.add_argument("--rep", type=str, choices=['dif', 'tensorf'],
                         default="dif", help="representation to use")
     

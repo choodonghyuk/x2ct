@@ -49,9 +49,22 @@ def gaussian_blur(img, kernel_size, sigma):
     return filter_img_2d(img, kernel)
 
 
-def eval_psnr(img1, img2, max_val=1.0, eps=1e-6):
-    mse = (img1 - img2).square().flatten(1).mean(dim=-1)
-    psnr = (10 * (2 * math.log10(max_val) - torch.log10(mse + eps)))
+def eval_psnr(img1, img2, max_val=1.0, eps=1e-10):
+    """
+    NAF-CBCT Style: Min-Max 정규화 후 PSNR 계산
+    """
+    # 이미지별 독립적 정규화 수행
+    img1_min, img1_max = img1.min(), img1.max()
+    img2_min, img2_max = img2.min(), img2.max()
+    
+    img1_norm = (img1 - img1_min) / (img1_max - img1_min + eps)
+    img2_norm = (img2 - img2_min) / (img2_max - img2_min + eps)
+    
+    # MSE 계산 (정규화된 이미지 기준)
+    mse = (img1_norm - img2_norm).square().flatten(1).mean(dim=-1)
+    
+    # PSNR 산출 (MAX_VAL = 1.0 기준)
+    psnr = -10. * torch.log10(mse + eps)
     return psnr
 
 

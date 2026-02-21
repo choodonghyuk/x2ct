@@ -12,6 +12,62 @@ from lib.ops import (
     march_rays_train, batch_composite_rays_train, march_rays, composite_rays,
     morton3D, morton3D_invert, packbits)
 from ..decoders.samplers import sample_ray_unbounded
+from lib.ops.raymarching import flatten_rays 
+
+def batch_composite_rays_xray(sigmas, ts, rays, num_points):
+    """
+    Beer-Lambert Law for X-ray attenuation (training path).
+    [Fix] Uses flatten_rays to handle scrambled memory layout from atomicAdd.
+    """
+    num_scenes = len(ts)
+
+    # 1. Concatenate all scenes
+    all_ts = torch.cat(ts, dim=0)  # (M_total, 2)
+    # CUDA ray marcher stores ts as [t_position, dt], so dt = ts[:, 1]
+    dts = all_ts[:, 1]  # (M_total,)
+
+    # 2. Compute per-sample attenuation contributions: μ * Δt
+    attenuation = sigmas * dts  # (M_total,)
+
+    # 3. Concatenate rays and adjust offsets for multi-scene batching
+    all_rays_list = []
+    num_rays_list = []
+    point_offset_total = 0
+    for ray_single, np_single in zip(rays, num_points):
+        # We need to shift the offsets because we concatenated the point buffers
+        adjusted_rays = torch.stack([
+            ray_single[:, 0] + point_offset_total,
+            ray_single[:, 1]
+        ], dim=-1)
+        all_rays_list.append(adjusted_rays)
+        num_rays_list.append(ray_single.size(0))
+        point_offset_total += np_single
+    
+    all_rays = torch.cat(all_rays_list, dim=0)  # (N_total, 2)
+    N_total = all_rays.size(0)
+    M_total = sigmas.shape[0] # Total number of points
+
+    # [핵심 수정] repeat_interleave 대신 flatten_rays 사용!
+    # rays[:, 0] (offset) 정보를 사용하여 정확한 Ray ID를 매핑합니다.
+    ray_indices = flatten_rays(all_rays.int(), M_total).long()
+
+    # 4. Scatter add: accumulate attenuation for each ray
+    projection = torch.zeros(N_total, 1, device=sigmas.device, dtype=sigmas.dtype)
+    projection.scatter_add_(0, ray_indices.unsqueeze(1), attenuation.unsqueeze(1))
+
+    # 5. Format output
+    weights = None
+    if all(n == num_rays_list[0] for n in num_rays_list):
+        nr = num_rays_list[0]
+        weights_sum = torch.zeros(num_scenes, nr, device=sigmas.device, dtype=sigmas.dtype)
+        depth = torch.zeros(num_scenes, nr, device=sigmas.device, dtype=sigmas.dtype)
+        image = projection.reshape(num_scenes, nr, 1)
+    else:
+        weights_sum = projection.new_zeros(N_total).split(num_rays_list, dim=0)
+        depth = projection.new_zeros(N_total).split(num_rays_list, dim=0)
+        image = projection.split(num_rays_list, dim=0)
+
+    return weights, weights_sum, depth, image
 
 
 class VolumeRenderer(nn.Module):
@@ -27,13 +83,15 @@ class VolumeRenderer(nn.Module):
                  preproc_size=None,
                  unbounded=False,
                  occlusion_culling_th=0.0001,
-                 has_time_dynamics=False):
+                 has_time_dynamics=False,
+                 xray_mode=False):
         super().__init__()
 
         self.bound = bound
         self.min_near = min_near
         self.bg_radius = bg_radius  # radius of the background sphere.
         self.max_steps = max_steps
+        self.xray_mode = xray_mode
         self.decoder_reg_loss = build_module(decoder_reg_loss) if decoder_reg_loss is not None else None
 
         self.preprocessor = None if preprocessor is None else build_module(preprocessor)
@@ -295,17 +353,32 @@ class VolumeRenderer(nn.Module):
                     xyzs_filt.append(xyzs_single[blk])
                     dirs_filt.append(dirs_single[blk])
                     occls_filt.append(blk)
-                sigmas_occl, rgbs_occl, _ = self.point_decode(xyzs_filt, dirs_filt, code)
+                if self.xray_mode:
+                    sigmas_occl, _, _ = self.point_decode(xyzs_filt, None, code)
+                else:
+                    sigmas_occl, rgbs_occl, _ = self.point_decode(xyzs_filt, dirs_filt, code)
                 sigmas = torch.zeros_like(sigmas)
                 occl = torch.cat(occls_filt)
                 sigmas[occl] = sigmas_occl
-                rgbs[occl] = rgbs_occl
-                if sigmas.dtype != dtype or rgbs.dtype != dtype:
-                    sigmas, rgbs = sigmas.to(dtype), rgbs.to(dtype)
-                weights, weights_sum, depth, image = batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points)
+                if not self.xray_mode:
+                    rgbs[occl] = rgbs_occl
+                if sigmas.dtype != dtype:
+                    sigmas = sigmas.to(dtype)
+                if self.xray_mode:
+                    # X-ray: Beer-Lambert law (simple integration)
+                    weights, weights_sum, depth, image = batch_composite_rays_xray(sigmas, ts, rays, num_points)
+                else:
+                    if rgbs.dtype != dtype:
+                        rgbs = rgbs.to(dtype)
+                    # RGB: Volume rendering
+                    weights, weights_sum, depth, image = batch_composite_rays_train(sigmas, rgbs, ts, rays, num_points)
             else:
-                sigmas, rgbs, num_points = self.point_decode(xyzs, dirs, code)
-                weights, weights_sum, depth, image = batch_composite_rays_train(sigmas.to(dtype), rgbs.to(dtype), ts, rays, num_points)
+                if self.xray_mode:
+                    sigmas, _, num_points = self.point_decode(xyzs, None, code)
+                    weights, weights_sum, depth, image = batch_composite_rays_xray(sigmas.to(dtype), ts, rays, num_points)
+                else:
+                    sigmas, rgbs, num_points = self.point_decode(xyzs, dirs, code)
+                    weights, weights_sum, depth, image = batch_composite_rays_train(sigmas.to(dtype), rgbs.to(dtype), ts, rays, num_points)
 
         else:
             device = rays_o.device
@@ -325,7 +398,9 @@ class VolumeRenderer(nn.Module):
 
                 weights_sum_single = torch.zeros(num_rays_per_scene, dtype=dtype, device=device)
                 depth_single = torch.zeros(num_rays_per_scene, dtype=dtype, device=device)
-                image_single = torch.zeros(num_rays_per_scene, 3, dtype=dtype, device=device)
+                # X-ray: 1 channel (attenuation), RGB: 3 channels
+                image_channels = 1 if self.xray_mode else 3
+                image_single = torch.zeros(num_rays_per_scene, image_channels, dtype=dtype, device=device)
 
                 num_rays_alive = num_rays_per_scene
                 rays_alive = torch.arange(num_rays_alive, dtype=torch.int32, device=device)  # (num_rays_alive,)
@@ -347,12 +422,33 @@ class VolumeRenderer(nn.Module):
                     if rays_time_single is not None:
                         times = rays_time_single.repeat(1, n_step).reshape(-1, 1)
                         xyzs = torch.cat([xyzs, times], dim=-1)
-                    sigmas, rgbs, _ = self.point_decode([xyzs], [dirs], code_single[None])
-                    if self.pre_gamma is not None:
-                        rgbs = rgbs ** self.pre_gamma
-                    composite_rays(
-                        num_rays_alive, n_step, rays_alive, rays_t, sigmas.to(dtype), rgbs.to(dtype), ts,
-                        weights_sum_single, depth_single, image_single)
+                    if self.xray_mode:
+                        sigmas, _, _ = self.point_decode([xyzs], None, code_single[None])
+                        # X-ray: Beer-Lambert — ts[:, 1] is dt (step size) from CUDA ray marcher
+                        dts = ts[:, 1]  # (num_alive * n_step,)
+                        attenuation = (sigmas * dts).reshape(num_rays_alive, n_step)
+                        image_single[rays_alive.long()] += attenuation.sum(dim=1, keepdim=True)
+
+                        # Advance rays_t and terminate finished rays
+                        # (composite_rays does this for RGB mode, we must do it manually)
+                        ts_reshaped = ts.reshape(num_rays_alive, n_step, 2)
+                        valid_steps = (ts_reshaped[:, :, 1] > 0).sum(dim=1)  # [n_alive]
+                        last_t = ts_reshaped[:, :, 0].max(dim=1).values  # [n_alive]
+                        # Rays that used all n_step steps: advance rays_t
+                        full_mask = (valid_steps >= n_step)
+                        if full_mask.any():
+                            active_ids = rays_alive[full_mask].long()
+                            rays_t[active_ids] = last_t[full_mask]
+                        # Rays that used fewer steps: they've gone past far, terminate
+                        rays_alive[~full_mask] = -1
+                    else:
+                        sigmas, rgbs, _ = self.point_decode([xyzs], [dirs], code_single[None])
+                        # RGB: Volume rendering
+                        if self.pre_gamma is not None:
+                            rgbs = rgbs ** self.pre_gamma
+                        composite_rays(
+                            num_rays_alive, n_step, rays_alive, rays_t, sigmas.to(dtype), rgbs.to(dtype), ts,
+                            weights_sum_single, depth_single, image_single)
                     if rays_time_single is not None:
                         rays_time_single = rays_time_single[rays_alive >= 0]
                     rays_alive = rays_alive[rays_alive >= 0]
@@ -372,7 +468,11 @@ class VolumeRenderer(nn.Module):
         )
 
         if return_loss:
-            results.update(sigmas=sigmas, rgbs=rgbs)
+            results.update(sigmas=sigmas)
+            if self.xray_mode:
+                results.update(rgbs=None)
+            else:
+                results.update(rgbs=rgbs)
             results.update(decoder_reg_loss=self.loss(results))
 
         return results
