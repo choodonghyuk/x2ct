@@ -116,11 +116,6 @@ class CommonDecoder(nn.Module):
         # Feature 디코딩
         base_x = self.base_net(point_code)
         x = self.base_activation(base_x)
-        
-        # [핵심] for 문을 사용하여 정의된 MLP 레이어들을 순차적으로 통과
-        x = self.mlp_activation(self.layer1(x))
-        x = self.mlp_activation(self.layer2(x))
-        x = self.mlp_activation(self.layer3(torch.cat([x, base_x], dim=-1)))
 
         # Attenuation(mu) 계산
         sigmas = self.density_net(x).squeeze(-1)
